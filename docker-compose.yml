@@ -5,7 +5,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: discord-music-bot:latest
     container_name: discord-music-bot
     restart: unless-stopped
     # Zmienne środowiskowe mogą pochodzić z pliku .env LUB bezpośrednio z Portainera (Stack Env)
