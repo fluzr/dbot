@@ -61,7 +61,7 @@ async def on_ready():
     else:
         print("⚠️ Brak DISCORD_GUILD_ID w konfiguracji. Komendy nie zostały zsynchronizowane.")
 
-    activity = discord.Activity(type=discord.ActivityType.listening, name="/play | Muzyka")
+    activity = discord.Activity(type=discord.ActivityType.listening, name="/play | Czekolada, smaczne orzechy")
     await bot.change_presence(activity=activity)
 
 
