@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  discord-music-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: discord-music-bot:latest
+    container_name: discord-music-bot
+    restart: unless-stopped
+    # Zmienne środowiskowe mogą pochodzić z pliku .env LUB bezpośrednio z Portainera (Stack Env)
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+      - DEFAULT_VOLUME=${DEFAULT_VOLUME:-50}
+      - AUTO_LEAVE_SECONDS=${AUTO_LEAVE_SECONDS:-300}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
