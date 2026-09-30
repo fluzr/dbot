@@ -29,8 +29,7 @@ def get_ffmpeg_path() -> str:
 
 YTDL_BASE_OPTIONS = {
     "format": "bestaudio/best",
-    "cookiefile": "cookies.txt",
-    "extractor_args": {"youtube": ["player_client=android"]},
+    "extractor_args": {"youtube": ["player_client=ios"]},
     "restrictfilenames": True,
     "noplaylist": True,
     "nocheckcertificate": True,
@@ -283,8 +282,7 @@ class MusicSourceManager:
         def extract():
             opts = {
                 "format": "bestaudio/best",
-                "cookiefile": "cookies.txt",
-                "extractor_args": {"youtube": ["player_client=android"]},
+                "extractor_args": {"youtube": ["player_client=ios"]},
                 "extract_flat": "in_playlist",
                 "noplaylist": False,
                 "nocheckcertificate": True,
