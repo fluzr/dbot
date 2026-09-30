@@ -286,7 +286,7 @@ class MusicSourceManager:
                 "extract_flat": "in_playlist",
                 "noplaylist": False,
                 "nocheckcertificate": True,
-                "ignoreerrors": True,
+                "ignoreerrors": False,
                 "quiet": True,
                 "no_warnings": True,
                 "default_search": "ytsearch1" if is_search else "auto",
