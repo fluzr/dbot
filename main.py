@@ -24,7 +24,8 @@ cmd_logger = logging.getLogger("mbot.cmd")
 voice_logger = logging.getLogger("mbot.voice")
 
 # Validate config before running
-config_errors = config.validate_config()
+validate_func = getattr(config, "validate_config", None)
+config_errors = validate_func() if callable(validate_func) else []
 if config_errors:
     logger.error("=" * 60)
     logger.error("BŁĘDY KONFIGURACJI (.env):")
@@ -80,9 +81,10 @@ async def on_ready():
     else:
         logger.warning("⚠️ Brak DISCORD_GUILD_ID w konfiguracji. Komendy slash nie zostały zsynchronizowane!")
 
-    activity = discord.Activity(type=discord.ActivityType.listening, name=config.BOT_STATUS)
+    bot_status = getattr(config, "BOT_STATUS", os.getenv("BOT_STATUS", "/play | Muzyka"))
+    activity = discord.Activity(type=discord.ActivityType.listening, name=bot_status)
     await bot.change_presence(activity=activity)
-    logger.info(f"🎮 Ustawiono status bota: 'Słucha {config.BOT_STATUS}'")
+    logger.info(f"🎮 Ustawiono status bota: 'Słucha {bot_status}'")
 
 
 @bot.event

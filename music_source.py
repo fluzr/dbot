@@ -30,7 +30,7 @@ def get_ffmpeg_path() -> str:
     return "ffmpeg"
 
 
-def get_ytdl_base_options() -> Dict[str, Any]:
+def get_ytdl_base_options(use_cookies: bool = True) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "format": "bestaudio/best",
         "restrictfilenames": True,
@@ -45,14 +45,16 @@ def get_ytdl_base_options() -> Dict[str, Any]:
             "youtube": {
                 # Używamy tv_embedded, tv oraz android_music, które omijają blokady IP datacenter (VPS) i SABR
                 "player_client": ["tv_embedded", "tv", "android_music", "mweb", "ios"],
+                "player_skip": ["webpage", "configs"],
             }
         },
     }
-    # Automatyczne podpięcie cookies.txt jeśli plik istnieje w katalogu bota
-    cookie_path = os.environ.get("YTDL_COOKIES_PATH", "cookies.txt")
-    if os.path.isfile(cookie_path):
-        opts["cookiefile"] = cookie_path
-        logger.debug(f"[YTDL] Wykryto i podpięto plik ciasteczek: {cookie_path}")
+    # Podpięcie cookies.txt jeśli plik istnieje i włączono use_cookies
+    if use_cookies:
+        cookie_path = os.environ.get("YTDL_COOKIES_PATH", "cookies.txt")
+        if os.path.isfile(cookie_path):
+            opts["cookiefile"] = cookie_path
+            logger.debug(f"[YTDL] Użyto pliku ciasteczek: {cookie_path}")
     return opts
 
 FFMPEG_OPTIONS = {
@@ -114,48 +116,68 @@ class Song:
 
         def extract():
             opts = get_ytdl_base_options()
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                try:
-                    logger.debug(f"[RESOLVE] Wywołanie ydl.extract_info('{query}', download=False)")
+            # 1. Próba bezpośrednia
+            try:
+                logger.debug(f"[RESOLVE] Wywołanie ydl.extract_info('{query}', download=False)")
+                with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(query, download=False)
                     if info and "entries" in info and info["entries"]:
                         logger.info(f"✅ [RESOLVE] Pomyślnie pobrano strumień z pierwszego wpisu dla: '{self.title}'")
                         return info["entries"][0]
-                    logger.info(f"✅ [RESOLVE] Bezpośrednie pobranie strumienia powiodło się dla: '{self.title}'")
-                    return info
-                except Exception as direct_err:
-                    logger.warning(f"⚠️ [RESOLVE] Bezpośrednie pobranie dla '{query}' nie powiodło się: {direct_err}")
-                    
-                    # Automatyczny fallback - gdy link YouTube ma ograniczenie 18+ lub blokadę IP datacenter
-                    fallback_candidates = []
-                    if self.title and self.title not in ("Wyszukiwanie...", "Nieznany utwór", "Utwór z playlisty"):
-                        clean_title = re.sub(r"[\[\(].*?[\]\)]", "", self.title).strip()
-                        if clean_title:
-                            fallback_candidates.append(f"ytsearch1:{clean_title} audio")
-                        fallback_candidates.append(f"ytsearch1:{self.title}")
-                        fallback_candidates.append(f"scsearch1:{clean_title or self.title}")
-                    
-                    if not fallback_candidates:
-                        logger.error(f"❌ [RESOLVE] Brak kandydatów do fallbacku dla utworu: '{self.title}'")
-                        raise direct_err
+                    if info and info.get("url"):
+                        logger.info(f"✅ [RESOLVE] Bezpośrednie pobranie strumienia powiodło się dla: '{self.title}'")
+                        return info
+            except Exception as direct_err:
+                logger.warning(f"⚠️ [RESOLVE] Bezpośrednie pobranie dla '{query}' nie powiodło się: {direct_err}")
 
-                    for fb_query in fallback_candidates:
-                        try:
-                            logger.info(f"🔄 [RESOLVE] Próba awaryjnego odnalezienia wersji utworu: '{fb_query}'")
-                            fb_info = ydl.extract_info(fb_query, download=False)
-                            if fb_info and "entries" in fb_info and fb_info["entries"]:
-                                chosen = fb_info["entries"][0]
-                                logger.info(f"✅ [RESOLVE] Awaryjne wyszukiwanie powiodło się! Wybrano: '{chosen.get('title')}'")
-                                return chosen
-                            elif fb_info and fb_info.get("url"):
-                                logger.info(f"✅ [RESOLVE] Awaryjne pobranie bezpośrednie powiodło się dla: '{fb_info.get('title')}'")
-                                return fb_info
-                        except Exception as fb_err:
-                            logger.warning(f"⚠️ [RESOLVE] Fallback '{fb_query}' nie powiódł się: {fb_err}")
-                            continue
+            # 2. Próba bez cookies jeśli cookies były w użyciu
+            if "cookiefile" in opts:
+                logger.info(f"🔄 [RESOLVE] Ponowna próba bez pliku cookies dla: '{self.title}'...")
+                try:
+                    opts_nc = get_ytdl_base_options(use_cookies=False)
+                    with yt_dlp.YoutubeDL(opts_nc) as ydl_nc:
+                        info = ydl_nc.extract_info(query, download=False)
+                        if info and "entries" in info and info["entries"]:
+                            logger.info(f"✅ [RESOLVE] Pobrano strumień bez cookies dla: '{self.title}'")
+                            return info["entries"][0]
+                        if info and info.get("url"):
+                            logger.info(f"✅ [RESOLVE] Pobrano bezpośrednio bez cookies dla: '{self.title}'")
+                            return info
+                except Exception as nc_err:
+                    logger.warning(f"⚠️ [RESOLVE] Próba bez cookies również nie powiodła się: {nc_err}")
 
-                    logger.error(f"❌ [RESOLVE] Wszystkie metody pobrania strumienia zawiodły dla: '{self.title}'. Oryginalny błąd: {direct_err}")
-                    raise direct_err
+            # 3. Automatyczny fallback na wyszukiwanie (np. 18+, reload page, blokada IP)
+            fallback_candidates = []
+            vid_match = re.search(r"(?:v=|\/|be\/)([0-9A-Za-z_-]{11})", query)
+            if vid_match:
+                vid_id = vid_match.group(1)
+                fallback_candidates.append(f"ytsearch1:{vid_id}")
+
+            if self.title and self.title not in ("Wyszukiwanie...", "Nieznany utwór", "Utwór z playlisty"):
+                clean_title = re.sub(r"[\[\(].*?[\]\)]", "", self.title).strip()
+                if clean_title:
+                    fallback_candidates.append(f"ytsearch1:{clean_title} audio")
+                fallback_candidates.append(f"ytsearch1:{self.title}")
+                fallback_candidates.append(f"scsearch1:{clean_title or self.title}")
+
+            fb_opts = get_ytdl_base_options(use_cookies=False)
+            with yt_dlp.YoutubeDL(fb_opts) as ydl_fb:
+                for fb_query in fallback_candidates:
+                    try:
+                        logger.info(f"🔄 [RESOLVE] Próba awaryjnego odnalezienia wersji utworu: '{fb_query}'")
+                        fb_info = ydl_fb.extract_info(fb_query, download=False)
+                        if fb_info and "entries" in fb_info and fb_info["entries"]:
+                            chosen = fb_info["entries"][0]
+                            logger.info(f"✅ [RESOLVE] Awaryjne wyszukiwanie powiodło się! Wybrano: '{chosen.get('title')}'")
+                            return chosen
+                        elif fb_info and fb_info.get("url"):
+                            logger.info(f"✅ [RESOLVE] Awaryjne pobranie bezpośrednie powiodło się dla: '{fb_info.get('title')}'")
+                            return fb_info
+                    except Exception as fb_err:
+                        logger.warning(f"⚠️ [RESOLVE] Fallback '{fb_query}' nie powiódł się: {fb_err}")
+                        continue
+
+            raise RuntimeError(f"Wszystkie metody pobrania strumienia zawiodły dla: '{self.title}'")
 
         data = await loop.run_in_executor(None, extract)
         if not data or not data.get("url"):
@@ -201,12 +223,13 @@ class Song:
 
 class MusicSourceManager:
     def __init__(self):
-        self.spotify: Optional[Spotify] = None
-        if config.SPOTIFY_CLIENT_ID and config.SPOTIFY_CLIENT_SECRET:
+        spotify_id = getattr(config, "SPOTIFY_CLIENT_ID", "")
+        spotify_secret = getattr(config, "SPOTIFY_CLIENT_SECRET", "")
+        if spotify_id and spotify_secret:
             try:
                 auth = SpotifyClientCredentials(
-                    client_id=config.SPOTIFY_CLIENT_ID,
-                    client_secret=config.SPOTIFY_CLIENT_SECRET,
+                    client_id=spotify_id,
+                    client_secret=spotify_secret,
                 )
                 self.spotify = Spotify(auth_manager=auth)
                 logger.info("🟢 [INIT] Integracja Spotify API została poprawnie skonfigurowana.")
@@ -371,7 +394,45 @@ class MusicSourceManager:
                 "default_search": "ytsearch1" if is_search else "auto",
             })
             with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(target_query, download=False)
+                res = ydl.extract_info(target_query, download=False)
+                if res and (("entries" in res and res["entries"]) or res.get("url") or res.get("webpage_url") or res.get("title")):
+                    return res
+
+            # Jeśli pobranie z plikiem cookies nie powiodło się, ponów bez ciasteczek
+            if "cookiefile" in opts:
+                logger.info(f"🔄 [YTDL] Pobranie z cookies nie powiodło się dla '{target_query}', ponawiam bez cookies...")
+                opts_nc = get_ytdl_base_options(use_cookies=False)
+                opts_nc.update({
+                    "extract_flat": "in_playlist",
+                    "noplaylist": False,
+                    "ignoreerrors": True,
+                    "default_search": "ytsearch1" if is_search else "auto",
+                })
+                with yt_dlp.YoutubeDL(opts_nc) as ydl_nc:
+                    res = ydl_nc.extract_info(target_query, download=False)
+                    if res and (("entries" in res and res["entries"]) or res.get("url") or res.get("webpage_url") or res.get("title")):
+                        return res
+
+            # Jeśli to bezpośredni link do YouTube (np. 'The page needs to be reloaded' / blokada strony)
+            if is_link and ("youtu.be" in query or "youtube.com" in query):
+                vid_match = re.search(r"(?:v=|\/|be\/)([0-9A-Za-z_-]{11})", query)
+                if vid_match:
+                    vid_id = vid_match.group(1)
+                    search_fallback = f"ytsearch1:{vid_id}"
+                    logger.info(f"🔄 [YTDL] Link bezpośredni zablokowany przez YouTube ('page reload'). Próba pobrania przez API wyszukiwania: '{search_fallback}'...")
+                    opts_fb = get_ytdl_base_options(use_cookies=False)
+                    opts_fb.update({
+                        "extract_flat": "in_playlist",
+                        "noplaylist": False,
+                        "ignoreerrors": True,
+                        "default_search": "ytsearch1",
+                    })
+                    with yt_dlp.YoutubeDL(opts_fb) as ydl_fb:
+                        res = ydl_fb.extract_info(search_fallback, download=False)
+                        if res and (("entries" in res and res["entries"]) or res.get("url") or res.get("webpage_url") or res.get("title")):
+                            return res
+
+            return None
 
         try:
             data = await loop.run_in_executor(None, extract)
