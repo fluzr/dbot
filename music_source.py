@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -8,6 +9,8 @@ import discord
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyClientCredentials
 import config
+
+logger = logging.getLogger("mbot.source")
 
 def get_ffmpeg_path() -> str:
     """Finds the ffmpeg executable, checking PATH and common WinGet install locations."""
@@ -27,21 +30,33 @@ def get_ffmpeg_path() -> str:
     return "ffmpeg"
 
 
-YTDL_BASE_OPTIONS = {
-    "format": "bestaudio/best",
-    "extractor_args": {"youtube": ["player_client=ios"]},
-    "restrictfilenames": True,
-    "noplaylist": True,
-    "nocheckcertificate": True,
-    "ignoreerrors": False,
-    "logtostderr": False,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-}
+def get_ytdl_base_options() -> Dict[str, Any]:
+    opts: Dict[str, Any] = {
+        "format": "bestaudio/best",
+        "restrictfilenames": True,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "ignoreerrors": False,
+        "logtostderr": False,
+        "quiet": True,
+        "no_warnings": True,
+        "default_search": "ytsearch",
+        "extractor_args": {
+            "youtube": {
+                # Używamy tv_embedded, tv oraz android_music, które omijają blokady IP datacenter (VPS) i SABR
+                "player_client": ["tv_embedded", "tv", "android_music", "mweb", "ios"],
+            }
+        },
+    }
+    # Automatyczne podpięcie cookies.txt jeśli plik istnieje w katalogu bota
+    cookie_path = os.environ.get("YTDL_COOKIES_PATH", "cookies.txt")
+    if os.path.isfile(cookie_path):
+        opts["cookiefile"] = cookie_path
+        logger.debug(f"[YTDL] Wykryto i podpięto plik ciasteczek: {cookie_path}")
+    return opts
 
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -timeout 300000000",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
 
@@ -81,41 +96,87 @@ class Song:
         self.stream_url = stream_url
         self.source_type = source_type
         self.search_query = search_query
+        self.http_headers: Dict[str, str] = {}
 
     @property
     def formatted_duration(self) -> str:
         return format_duration(self.duration)
 
     async def resolve_stream(self) -> None:
-        """Resolves the direct audio stream URL if not already known."""
+        """Resolves the direct audio stream URL if not already known, with smart search fallback."""
         if self.stream_url:
+            logger.debug(f"[RESOLVE] Utwór '{self.title}' posiada już pobrany stream URL.")
             return
 
         loop = asyncio.get_running_loop()
         query = self.search_query or self.web_url
+        logger.info(f"⏳ [RESOLVE] Rozpoczynam pobieranie bezpośredniego linku do audio dla: '{self.title}' (query: '{query}')")
 
         def extract():
-            opts = dict(YTDL_BASE_OPTIONS)
+            opts = get_ytdl_base_options()
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(query, download=False)
-                if "entries" in info and info["entries"]:
-                    return info["entries"][0]
-                return info
+                try:
+                    logger.debug(f"[RESOLVE] Wywołanie ydl.extract_info('{query}', download=False)")
+                    info = ydl.extract_info(query, download=False)
+                    if info and "entries" in info and info["entries"]:
+                        logger.info(f"✅ [RESOLVE] Pomyślnie pobrano strumień z pierwszego wpisu dla: '{self.title}'")
+                        return info["entries"][0]
+                    logger.info(f"✅ [RESOLVE] Bezpośrednie pobranie strumienia powiodło się dla: '{self.title}'")
+                    return info
+                except Exception as direct_err:
+                    logger.warning(f"⚠️ [RESOLVE] Bezpośrednie pobranie dla '{query}' nie powiodło się: {direct_err}")
+                    
+                    # Automatyczny fallback - gdy link YouTube ma ograniczenie 18+ lub blokadę IP datacenter
+                    fallback_candidates = []
+                    if self.title and self.title not in ("Wyszukiwanie...", "Nieznany utwór", "Utwór z playlisty"):
+                        clean_title = re.sub(r"[\[\(].*?[\]\)]", "", self.title).strip()
+                        if clean_title:
+                            fallback_candidates.append(f"ytsearch1:{clean_title} audio")
+                        fallback_candidates.append(f"ytsearch1:{self.title}")
+                        fallback_candidates.append(f"scsearch1:{clean_title or self.title}")
+                    
+                    if not fallback_candidates:
+                        logger.error(f"❌ [RESOLVE] Brak kandydatów do fallbacku dla utworu: '{self.title}'")
+                        raise direct_err
+
+                    for fb_query in fallback_candidates:
+                        try:
+                            logger.info(f"🔄 [RESOLVE] Próba awaryjnego odnalezienia wersji utworu: '{fb_query}'")
+                            fb_info = ydl.extract_info(fb_query, download=False)
+                            if fb_info and "entries" in fb_info and fb_info["entries"]:
+                                chosen = fb_info["entries"][0]
+                                logger.info(f"✅ [RESOLVE] Awaryjne wyszukiwanie powiodło się! Wybrano: '{chosen.get('title')}'")
+                                return chosen
+                            elif fb_info and fb_info.get("url"):
+                                logger.info(f"✅ [RESOLVE] Awaryjne pobranie bezpośrednie powiodło się dla: '{fb_info.get('title')}'")
+                                return fb_info
+                        except Exception as fb_err:
+                            logger.warning(f"⚠️ [RESOLVE] Fallback '{fb_query}' nie powiódł się: {fb_err}")
+                            continue
+
+                    logger.error(f"❌ [RESOLVE] Wszystkie metody pobrania strumienia zawiodły dla: '{self.title}'. Oryginalny błąd: {direct_err}")
+                    raise direct_err
 
         data = await loop.run_in_executor(None, extract)
-        if not data:
-            raise RuntimeError(f"Nie udało się uzyskać strumienia audio dla: {self.title}")
+        if not data or not data.get("url"):
+            err_msg = f"Nie udało się uzyskać URL strumienia audio dla utworu: {self.title}"
+            logger.error(f"❌ [RESOLVE] {err_msg}")
+            raise RuntimeError(err_msg)
 
-        # Update metadata if resolved from search
+        # Update metadata if resolved from search / fallback
         self.stream_url = data.get("url")
-        if not self.title or self.title == "Wyszukiwanie...":
+        self.http_headers = data.get("http_headers") or {}
+        if not self.title or self.title in ("Wyszukiwanie...", "Nieznany utwór"):
             self.title = data.get("title", self.title)
         if not self.duration:
-            self.duration = int(data.get("duration", 0))
+            self.duration = int(data.get("duration", 0) or 0)
         if not self.thumbnail:
             self.thumbnail = data.get("thumbnail")
         if not self.uploader:
             self.uploader = data.get("uploader") or data.get("channel")
+
+        stream_domain = self.stream_url.split('/')[2] if '://' in self.stream_url else 'nieznana'
+        logger.info(f"🎉 [RESOLVE] Pomyślnie przygotowano strumień audio dla: '{self.title}' [{self.formatted_duration}] | Serwer: {stream_domain}")
 
     def create_audio_source(self, volume: float = 0.5) -> discord.AudioSource:
         """Creates an FFmpegPCMAudio wrapped in PCMVolumeTransformer."""
@@ -123,10 +184,16 @@ class Song:
             raise RuntimeError("Stream URL nie został zainicjalizowany przed odtwarzaniem!")
 
         ffmpeg_bin = get_ffmpeg_path()
+        logger.info(f"🎵 [FFMPEG] Inicjalizacja odtwarzacza FFmpeg dla: '{self.title}' | Binarka: '{ffmpeg_bin}' | Głośność: {int(volume * 100)}%")
+        before_opts = FFMPEG_OPTIONS["before_options"]
+        if self.http_headers and "User-Agent" in self.http_headers:
+            ua = self.http_headers["User-Agent"]
+            before_opts += f' -user_agent "{ua}"'
+
         audio = discord.FFmpegPCMAudio(
             self.stream_url,
             executable=ffmpeg_bin,
-            before_options=FFMPEG_OPTIONS["before_options"],
+            before_options=before_opts,
             options=FFMPEG_OPTIONS["options"],
         )
         return discord.PCMVolumeTransformer(audio, volume=volume)
@@ -142,8 +209,11 @@ class MusicSourceManager:
                     client_secret=config.SPOTIFY_CLIENT_SECRET,
                 )
                 self.spotify = Spotify(auth_manager=auth)
+                logger.info("🟢 [INIT] Integracja Spotify API została poprawnie skonfigurowana.")
             except Exception as e:
-                print(f"[OSTRZEŻENIE] Błąd inicjalizacji Spotify API: {e}")
+                logger.warning(f"⚠️ [INIT] Błąd inicjalizacji Spotify API: {e}")
+        else:
+            logger.info("ℹ️ [INIT] Spotify API nie zostało skonfigurowane w .env (linki Spotify będą ignorowane).")
 
     def is_spotify_url(self, query: str) -> bool:
         return "spotify.com" in query.lower()
@@ -164,6 +234,7 @@ class MusicSourceManager:
                 "wprowadź `SPOTIFY_CLIENT_ID` oraz `SPOTIFY_CLIENT_SECRET` w pliku `.env`."
             )
 
+        logger.info(f"🔍 [SPOTIFY] Parsowanie linku: {url} | Użytkownik: {requester.display_name if requester else 'nieznany'}")
         loop = asyncio.get_running_loop()
 
         # Extract Spotify ID and type
@@ -171,103 +242,112 @@ class MusicSourceManager:
         playlist_match = re.search(r"spotify\.com/playlist/([a-zA-Z0-9]+)", url)
         album_match = re.search(r"spotify\.com/album/([a-zA-Z0-9]+)", url)
 
-        if track_match:
-            track_id = track_match.group(1)
-            track_data = await loop.run_in_executor(None, lambda: self.spotify.track(track_id))
-            artists = ", ".join(a["name"] for a in track_data.get("artists", []))
-            title = track_data.get("name", "Nieznany utwór")
-            search_query = f"{title} {artists}"
-            thumbnail = None
-            if track_data.get("album", {}).get("images"):
-                thumbnail = track_data["album"]["images"][0]["url"]
-
-            duration = int(track_data.get("duration_ms", 0) / 1000)
-            song = Song(
-                title=f"{artists} - {title}",
-                web_url=track_data.get("external_urls", {}).get("spotify", url),
-                duration=duration,
-                thumbnail=thumbnail,
-                uploader=artists,
-                requester=requester,
-                source_type="spotify",
-                search_query=search_query,
-            )
-            return [song], "track"
-
-        elif album_match:
-            album_id = album_match.group(1)
-            album_data = await loop.run_in_executor(None, lambda: self.spotify.album(album_id))
-            album_title = album_data.get("name", "Album")
-            thumbnail = album_data["images"][0]["url"] if album_data.get("images") else None
-            songs: List[Song] = []
-
-            for item in album_data.get("tracks", {}).get("items", []):
-                artists = ", ".join(a["name"] for a in item.get("artists", []))
-                title = item.get("name", "")
-                duration = int(item.get("duration_ms", 0) / 1000)
+        try:
+            if track_match:
+                track_id = track_match.group(1)
+                track_data = await loop.run_in_executor(None, lambda: self.spotify.track(track_id))
+                artists = ", ".join(a["name"] for a in track_data.get("artists", []))
+                title = track_data.get("name", "Nieznany utwór")
                 search_query = f"{title} {artists}"
-                songs.append(
-                    Song(
-                        title=f"{artists} - {title}",
-                        web_url=item.get("external_urls", {}).get("spotify", url),
-                        duration=duration,
-                        thumbnail=thumbnail,
-                        uploader=artists,
-                        requester=requester,
-                        source_type="spotify",
-                        search_query=search_query,
+                thumbnail = None
+                if track_data.get("album", {}).get("images"):
+                    thumbnail = track_data["album"]["images"][0]["url"]
+
+                duration = int(track_data.get("duration_ms", 0) / 1000)
+                song = Song(
+                    title=f"{artists} - {title}",
+                    web_url=track_data.get("external_urls", {}).get("spotify", url),
+                    duration=duration,
+                    thumbnail=thumbnail,
+                    uploader=artists,
+                    requester=requester,
+                    source_type="spotify",
+                    search_query=search_query,
+                )
+                logger.info(f"✅ [SPOTIFY] Pomyślnie sparsowano utwór: '{song.title}' [{song.formatted_duration}]")
+                return [song], "track"
+
+            elif album_match:
+                album_id = album_match.group(1)
+                album_data = await loop.run_in_executor(None, lambda: self.spotify.album(album_id))
+                album_title = album_data.get("name", "Album")
+                thumbnail = album_data["images"][0]["url"] if album_data.get("images") else None
+                songs: List[Song] = []
+
+                for item in album_data.get("tracks", {}).get("items", []):
+                    artists = ", ".join(a["name"] for a in item.get("artists", []))
+                    title = item.get("name", "")
+                    duration = int(item.get("duration_ms", 0) / 1000)
+                    search_query = f"{title} {artists}"
+                    songs.append(
+                        Song(
+                            title=f"{artists} - {title}",
+                            web_url=item.get("external_urls", {}).get("spotify", url),
+                            duration=duration,
+                            thumbnail=thumbnail,
+                            uploader=artists,
+                            requester=requester,
+                            source_type="spotify",
+                            search_query=search_query,
+                        )
                     )
+                logger.info(f"✅ [SPOTIFY] Pomyślnie załadowano album '{album_title}' ({len(songs)} utworów)")
+                return songs, f"album: {album_title}"
+
+            elif playlist_match:
+                playlist_id = playlist_match.group(1)
+                playlist_data = await loop.run_in_executor(
+                    None, lambda: self.spotify.playlist(playlist_id)
                 )
-            return songs, f"album: {album_title}"
+                playlist_name = playlist_data.get("name", "Playlista")
+                thumbnail = playlist_data["images"][0]["url"] if playlist_data.get("images") else None
 
-        elif playlist_match:
-            playlist_id = playlist_match.group(1)
-            playlist_data = await loop.run_in_executor(
-                None, lambda: self.spotify.playlist(playlist_id)
-            )
-            playlist_name = playlist_data.get("name", "Playlista")
-            thumbnail = playlist_data["images"][0]["url"] if playlist_data.get("images") else None
-
-            # Fetch items (up to 100 or pagination)
-            tracks_result = playlist_data.get("tracks", {})
-            items = list(tracks_result.get("items", []))
-            
-            # Fetch remaining items if any (limit to max 200 to prevent huge memory overhead)
-            while tracks_result.get("next") and len(items) < 200:
-                tracks_result = await loop.run_in_executor(
-                    None, lambda: self.spotify.next(tracks_result)
-                )
-                items.extend(tracks_result.get("items", []))
-
-            songs: List[Song] = []
-            for entry in items:
-                track = entry.get("track")
-                if not track or not track.get("name"):
-                    continue
-                artists = ", ".join(a["name"] for a in track.get("artists", []))
-                title = track.get("name", "")
-                duration = int(track.get("duration_ms", 0) / 1000)
-                track_thumb = thumbnail
-                if track.get("album", {}).get("images"):
-                    track_thumb = track["album"]["images"][0]["url"]
-
-                search_query = f"{title} {artists}"
-                songs.append(
-                    Song(
-                        title=f"{artists} - {title}",
-                        web_url=track.get("external_urls", {}).get("spotify", url),
-                        duration=duration,
-                        thumbnail=track_thumb,
-                        uploader=artists,
-                        requester=requester,
-                        source_type="spotify",
-                        search_query=search_query,
+                # Fetch items (up to 100 or pagination)
+                tracks_result = playlist_data.get("tracks", {})
+                items = list(tracks_result.get("items", []))
+                
+                # Fetch remaining items if any (limit to max 200 to prevent huge memory overhead)
+                while tracks_result.get("next") and len(items) < 200:
+                    tracks_result = await loop.run_in_executor(
+                        None, lambda: self.spotify.next(tracks_result)
                     )
-                )
-            return songs, f"playlista: {playlist_name}"
+                    items.extend(tracks_result.get("items", []))
 
-        else:
-            raise ValueError("Nieobsługiwany format linku Spotify! Podaj link do utworu, playlisty lub albumu.")
+                songs: List[Song] = []
+                for entry in items:
+                    track = entry.get("track")
+                    if not track or not track.get("name"):
+                        continue
+                    artists = ", ".join(a["name"] for a in track.get("artists", []))
+                    title = track.get("name", "")
+                    duration = int(track.get("duration_ms", 0) / 1000)
+                    track_thumb = thumbnail
+                    if track.get("album", {}).get("images"):
+                        track_thumb = track["album"]["images"][0]["url"]
+
+                    search_query = f"{title} {artists}"
+                    songs.append(
+                        Song(
+                            title=f"{artists} - {title}",
+                            web_url=track.get("external_urls", {}).get("spotify", url),
+                            duration=duration,
+                            thumbnail=track_thumb,
+                            uploader=artists,
+                            requester=requester,
+                            source_type="spotify",
+                            search_query=search_query,
+                        )
+                    )
+                logger.info(f"✅ [SPOTIFY] Pomyślnie załadowano playlistę '{playlist_name}' ({len(songs)} utworów)")
+                return songs, f"playlista: {playlist_name}"
+
+            else:
+                err_msg = "Nieobsługiwany format linku Spotify! Podaj link do utworu, playlisty lub albumu."
+                logger.warning(f"⚠️ [SPOTIFY] {err_msg} (URL: {url})")
+                raise ValueError(err_msg)
+        except Exception as e:
+            logger.error(f"❌ [SPOTIFY] Błąd pobierania danych ze Spotify: {e}", exc_info=True)
+            raise e
 
     async def parse_ytdlp(
         self, query: str, requester: Optional[discord.Member]
@@ -277,32 +357,37 @@ class MusicSourceManager:
 
         is_link = self.is_url(query)
         is_search = not is_link
+        target_query = f"ytsearch1:{query}" if is_search else query
+
+        logger.info(f"🔍 [YTDL] Rozpoczynam parsowanie: '{query}' (tryb: {'link bezpośredni' if is_link else f'wyszukiwanie YouTube: {target_query}'}) | Użytkownik: {requester.display_name if requester else 'brak'}")
 
         # Use extract_flat to avoid freezing when encountering big playlists
         def extract():
-            opts = {
-                "format": "bestaudio/best",
-                "extractor_args": {"youtube": ["player_client=ios"]},
+            opts = get_ytdl_base_options()
+            opts.update({
                 "extract_flat": "in_playlist",
                 "noplaylist": False,
-                "nocheckcertificate": True,
-                "ignoreerrors": False,
-                "quiet": False,
-                "no_warnings": True,
+                "ignoreerrors": True,
                 "default_search": "ytsearch1" if is_search else "auto",
-            }
-            target_query = f"ytsearch1:{query}" if is_search else query
+            })
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(target_query, download=False)
 
-        data = await loop.run_in_executor(None, extract)
+        try:
+            data = await loop.run_in_executor(None, extract)
+        except Exception as e:
+            logger.error(f"❌ [YTDL] Błąd podczas pobierania informacji dla '{target_query}': {e}", exc_info=True)
+            raise e
+
         if not data:
+            logger.warning(f"⚠️ [YTDL] Brak wyników dla: '{target_query}'")
             raise ValueError("Nie znaleziono wyników dla podanego zapytania.")
 
         # Check if it's a playlist or search result list
         if "entries" in data and data["entries"]:
             entries = [e for e in data["entries"] if e]
             if not entries:
+                logger.warning(f"⚠️ [YTDL] Lista entries jest pusta dla: '{target_query}'")
                 raise ValueError("Brak dostępnych utworów.")
 
             if is_search or len(entries) == 1:
@@ -319,6 +404,7 @@ class MusicSourceManager:
                     source_type="soundcloud" if "soundcloud" in url else "youtube",
                     search_query=url,
                 )
+                logger.info(f"✅ [YTDL] Pomyślnie znaleziono utwór: '{song.title}' [{song.formatted_duration}] | Kanał: {song.uploader} | URL: {song.web_url}")
                 return [song], "track"
             else:
                 # Full playlist / set
@@ -343,6 +429,7 @@ class MusicSourceManager:
                             search_query=url,
                         )
                     )
+                logger.info(f"✅ [YTDL] Pomyślnie sparsowano playlistę '{playlist_title}' z {len(songs)} utworami.")
                 return songs, f"playlista: {playlist_title}"
         else:
             # Single direct link
@@ -358,6 +445,7 @@ class MusicSourceManager:
                 source_type="soundcloud" if "soundcloud" in url else "youtube",
                 search_query=url,
             )
+            logger.info(f"✅ [YTDL] Bezpośredni link: '{song.title}' [{song.formatted_duration}] | Kanał: {song.uploader} | URL: {song.web_url}")
             return [song], "track"
 
     async def get_songs(
@@ -365,6 +453,8 @@ class MusicSourceManager:
     ) -> Tuple[List[Song], str]:
         """Extracts songs from Spotify, YouTube, SoundCloud, or search query."""
         query = query.strip()
+        user_str = f"{requester} (ID: {requester.id})" if requester else "nieznany"
+        logger.info(f"📥 [MANAGER] Nowe zapytanie od {user_str}: '{query}'")
         if self.is_spotify_url(query):
             return await self.parse_spotify(query, requester)
         else:
