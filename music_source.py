@@ -52,7 +52,7 @@ def _get_cookie_path() -> Optional[str]:
     return None
 
 
-def get_ytdl_base_options(use_cookies: bool = True) -> Dict[str, Any]:
+def get_ytdl_base_options(use_cookies: bool = False) -> Dict[str, Any]:
     opts: Dict[str, Any] = {
         "format": "bestaudio/best",
         "restrictfilenames": True,
@@ -63,14 +63,16 @@ def get_ytdl_base_options(use_cookies: bool = True) -> Dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "default_search": "ytsearch",
-        # Allow all content — no age restriction (18+ requires valid cookies or android_vr client)
+        # Allow all content — no age restriction (android_vr bypasses age gate without 403)
         "age_limit": None,
         "extractor_args": {
             "youtube": {
-                # 'web' — uses cookies for age-gate authentication
-                # 'android_vr' — bypasses age verification even without cookies
-                # 'ios', 'mweb' — reliable mobile clients
-                "player_client": ["web", "android_vr", "ios", "mweb"],
+                # Klienci NIE powodujący błędu 403 Forbidden na VPS / datacenter IP:
+                # - 'ios': zalecany klient do discord botów, brak 403, wysoka jakość
+                # - 'android_vr': omija weryfikację wieku (18+) bez wymogu logowania i bez 403
+                # - 'mweb', 'android', 'tv_embedded': bezpieczne alternatywy
+                # NIE UŻYWAĆ 'web' — YouTube desktop web na VPS rzuca HTTP 403 Forbidden na googlevideo!
+                "player_client": ["ios", "android_vr", "mweb", "android", "tv_embedded"],
             }
         },
         "socket_timeout": 15,
@@ -201,21 +203,27 @@ class Song:
             # 2. STANDARD / YOUTUBE EXTRACTION WITH 18+ SUPPORT
             attempts: List[Tuple[str, Dict[str, Any], str]] = []
 
-            # 2a. Direct with cookies (authenticates age-restricted content if user account is 18+)
-            if _get_cookie_path():
-                attempts.append(("bezpośrednie (z cookies)", get_ytdl_base_options(use_cookies=True), query))
+            # 2a. Direct VPS extraction without cookies (uses VPS IP, avoids 403 IP-lock, android_vr bypasses 18+)
+            attempts.append(("bezpośrednie (ios/android_vr)", get_ytdl_base_options(use_cookies=False), query))
 
-            # 2b. android_vr client (known to bypass YouTube age-gate even without cookies)
+            # 2b. Explicit android_vr bypass for age-restricted videos (18+)
             opts_vr = get_ytdl_base_options(use_cookies=False)
             opts_vr["extractor_args"] = {
                 "youtube": {
-                    "player_client": ["android_vr", "mweb", "android"],
+                    "player_client": ["android_vr", "tv_embedded"],
                 }
             }
             attempts.append(("android_vr bypass (18+)", opts_vr, query))
 
-            # 2c. Direct extraction without cookies
-            attempts.append(("bezpośrednie (bez cookies)", get_ytdl_base_options(use_cookies=False), query))
+            # 2c. If extraction without cookies failed, try with cookies using mweb client
+            if _get_cookie_path():
+                opts_cookies = get_ytdl_base_options(use_cookies=True)
+                opts_cookies["extractor_args"] = {
+                    "youtube": {
+                        "player_client": ["mweb", "ios", "android"],
+                    }
+                }
+                attempts.append(("z plikiem cookies (mweb)", opts_cookies, query))
 
             # 2d. Fallback searches for blocked videos
             fallback_queries: List[str] = []
@@ -560,7 +568,7 @@ class MusicSourceManager:
         logger.info(f"🔍 [YTDL] Rozpoczynam parsowanie: '{query}' (tryb: {'link bezpośredni' if is_link else f'wyszukiwanie YouTube: {target_query}'}) | Użytkownik: {requester.display_name if requester else 'brak'}")
 
         def extract():
-            opts = get_ytdl_base_options()
+            opts = get_ytdl_base_options(use_cookies=False)
             opts.update({
                 "extract_flat": "in_playlist",
                 "noplaylist": False,
@@ -572,18 +580,18 @@ class MusicSourceManager:
                 if res and (("entries" in res and res["entries"]) or res.get("url") or res.get("webpage_url") or res.get("title")):
                     return res
 
-            # Jeśli pobranie z plikiem cookies nie powiodło się, ponów bez ciasteczek
+            # Jeśli pobranie bez cookies nie powiodło się, próba z ciasteczkami
             if _get_cookie_path():
-                logger.info(f"🔄 [YTDL] Pobranie z cookies nie powiodło się dla '{target_query}', ponawiam bez cookies...")
-                opts_nc = get_ytdl_base_options(use_cookies=False)
-                opts_nc.update({
+                logger.info(f"🔄 [YTDL] Próba z plikiem cookies dla '{target_query}'...")
+                opts_c = get_ytdl_base_options(use_cookies=True)
+                opts_c.update({
                     "extract_flat": "in_playlist",
                     "noplaylist": False,
                     "ignoreerrors": True,
                     "default_search": "ytsearch1" if is_search else "auto",
                 })
-                with yt_dlp.YoutubeDL(opts_nc) as ydl_nc:
-                    res = ydl_nc.extract_info(target_query, download=False)
+                with yt_dlp.YoutubeDL(opts_c) as ydl_c:
+                    res = ydl_c.extract_info(target_query, download=False)
                     if res and (("entries" in res and res["entries"]) or res.get("url") or res.get("webpage_url") or res.get("title")):
                         return res
 
